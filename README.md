@@ -1,24 +1,26 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# PunchStats
+
+A TypeScript-based fight statistics and analytics platform, built with Next.js and PostgreSQL.
 
 ## Getting Started
 
-First, run the development server:
+To get up and running locally:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install && pnpm setup && pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then visit [http://localhost:3000/fighters](http://localhost:3000/fighters) to see the fighter directory.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+The `setup` script:
+1. Starts a local PostgreSQL container via Docker Compose
+2. Runs database migrations
+3. Seeds the database with fictional test data
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Once the app is running, you can also:
+- Visit [http://localhost:3000](http://localhost:3000) for the home page with navigation
+- Run `pnpm test` to execute the integration test suite against the test database
+- Run `pnpm build` and `pnpm start` for production builds
 
 ## Learn More
 

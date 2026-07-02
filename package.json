@@ -11,6 +11,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:seed": "tsx src/db/seed.ts",
+    "setup": "docker compose up -d && pnpm db:migrate && pnpm db:seed",
     "test": "vitest run"
   },
   "dependencies": {
