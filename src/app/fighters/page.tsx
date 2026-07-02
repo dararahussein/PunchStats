@@ -1,5 +1,10 @@
 import { listFighters } from "@/modules/fighters/queries";
 
+// The fighter roster changes independently of deploys (evidence review,
+// publish/unpublish), so this page must query on every request rather than
+// be frozen at build time as a static page.
+export const dynamic = "force-dynamic";
+
 export default async function FightersPage() {
   const fighters = await listFighters();
 
