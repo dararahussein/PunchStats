@@ -209,15 +209,19 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
    - `weight-classes.ts` — the 17 real men's divisions with their real weight limits. This is sport-rule reference data (objective, uncontested, not a "fighter fact"), not the kind of data this rule is protecting against — seed it for real.
    - `fighters.ts` — **fictional** fighters only: e.g. `"Test Fighter One"` / slug `test-fighter-1`, `"Jane Example"` / slug `jane-example-boxer`, with made-up but internally-consistent vitals (birth dates, stances, divisions). Use deterministic fixed UUIDs (not `gen_random_uuid()` at insert time) so tests can assert against known IDs. **Include at least one fighter in each `publication_status`:** one left as `draft` (the default — no evidence needed), and one set to `published` (this one must have a qualifying `fighter_evidence` row — see below — since the seed script should call `publishFighter` for it, not just set the column directly, to exercise the real code path).
    - `fighter-aliases.ts` — one or two fictional aliases per fixture fighter (e.g. "Test Fighter One" → alias "TF1"), optionally citing the fixture source document below.
-   - `source-documents.ts` / `fighter-evidence.ts` — one or two example rows (e.g. a fake "Test Commission Report" source, one `fighter_evidence` row citing it for the fixture fighter that will be published — `verification_status: 'verified'`, `confidence` explicitly set — enough to satisfy the publish eligibility rule) — enough to prove the join and the invariant work, not exhaustive.
+   - `source-documents.ts` / `fighter-evidence.ts` — one or two example rows (e.g. a fake "Test Commission Report" source, one `fighter_evidence` row citing it for the fixture fighter that will be published — `verification_status: 'verified'`, `confidence: 'high'` or `'medium'` explicitly set — enough to *qualify* it per the precise rule below) — enough to prove the join and the invariant work, not exhaustive.
    - A top-level comment in this folder: `// Fictional data for local development and automated tests. Do not add real fighters here — see docs/SLICE_1_FOUNDATION.md.`
    - Create `src/db/fixtures/production/` as an **empty folder with a `README.md` stub** stating: "Real, source-reviewed fighter data goes here once the data-entry and provenance workflow is finalized (post-MVP-foundation). Not populated during Slice 1."
 
-8. **Publication-state service functions.** Create `src/db/services/fighter-publication.ts` implementing the invariant specified in [DATABASE.md](DATABASE.md#resolving-the-missing-citation-invariant-fighter-publication-state):
-   - `publishFighter(fighterId: string)` — in one transaction: query `fighter_evidence` for at least one row with `fighter_id = $1 AND verification_status = 'verified'`; if none, return a typed failure and roll back; if found, `UPDATE fighters SET publication_status = 'published' WHERE id = $1`.
-   - `deleteFighterEvidence(evidenceId: string)` — in one transaction: look up the evidence row's `fighter_id`, delete it, then check whether any qualifying (`verified`) evidence rows remain for that fighter; if none remain **and** the fighter is currently `published`, `UPDATE fighters SET publication_status = 'draft'` in the same transaction.
-   - Both functions live in `src/db/`, not `src/modules/`, since this is a database-invariant concern owned by the schema, not a "fighters module" query — Slice 1B still ships no application query layer (that stays 1C's job).
-   - This task is the one place Slice 1B does more than schema/migrations/fixtures — flagged as an intentional, narrow exception because the invariant is fundamentally a write-time data-integrity rule, not a read concern.
+8. **Publication-state service functions.** Create `src/modules/fighters/services/publication.ts` implementing the invariant specified in [DATABASE.md](DATABASE.md#resolving-the-missing-citation-invariant-fighter-publication-state). **This lives in the fighters module, not `src/db/`** — publishing is fighter-domain business logic; the database layer only needs to expose the transaction/query primitives these functions call.
+
+   **Qualifying evidence, precisely** (a `fighter_evidence` row counts toward publication when *all* of these hold): belongs to the fighter in question; `verification_status = 'verified'`; `confidence IN ('high', 'medium')` (a `'low'`-confidence verified claim doesn't count on its own); its `source_document_id` FK resolves (guaranteed by the schema, not a separate check). One qualifying row is enough — no per-field requirement yet.
+
+   - `publishFighter(fighterId: string)` — in one transaction: `SELECT ... FROM fighters WHERE id = $1 FOR UPDATE` to lock the fighter row *first*, then count qualifying `fighter_evidence` rows for that fighter (query, defined in `src/db/`, called from here). If zero, roll back and return a typed failure. If at least one, `UPDATE fighters SET publication_status = 'published' WHERE id = $1`, commit.
+   - `deleteFighterEvidence(evidenceId: string)` — in one transaction: look up the evidence row's `fighter_id`, then lock that fighter row (`SELECT ... FOR UPDATE`) **before** deleting anything, delete the evidence row, re-count qualifying evidence for that fighter, and only if the count is now zero *and* the (freshly-read, locked) fighter is currently `published`, set `publication_status = 'draft'` in the same transaction, then commit.
+   - **Why lock the fighter row first, in both functions:** without it, `publishFighter` counting one qualifying row and `deleteFighterEvidence` deleting that same row can interleave — both could commit believing their view was current, leaving a `published` fighter with zero qualifying evidence. Locking the fighter row at the start of each transaction serializes the two operations against each other.
+   - **Nothing else may set `publication_status`.** Any general-purpose fighter-update function's input type must omit `publication_status` entirely — not a convention, a type-level exclusion — so there is no accidental path to setting it other than through `publishFighter`.
+   - This is the one place Slice 1B does more than schema/migrations/fixtures — an intentional, narrow exception because the invariant is fighter-domain write logic that the schema alone can't express safely (see the race-condition discussion above).
 
 9. **Seed script.** `src/db/seed.ts` imports the dev fixtures and inserts them via the client (weight classes → fighters → aliases → source documents → evidence, in FK order), then calls `publishFighter` for the fixture fighter designated `published` (rather than inserting `publication_status = 'published'` directly), so the seed script itself exercises the real invariant. Add to `package.json`:
    ```json
@@ -239,13 +243,15 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
     - A new fighter defaults to `publication_status = 'draft'` when not specified.
     - Each test cleans up its own rows (transaction rollback per test, or truncate in `afterEach`) so tests are independent of fixture/seed state.
 
-    Write `src/db/services/fighter-publication.test.ts` (the invariant itself — this is the test coverage the plan's approval explicitly asked for):
+    Write `src/modules/fighters/services/publication.test.ts` (the invariant itself — this is the test coverage the plan's approval explicitly asked for):
     - Creating a draft fighter with zero `fighter_evidence` rows succeeds (plain insert, no service function needed).
     - `publishFighter` on a fighter with no qualifying evidence fails, and `publication_status` remains `'draft'`.
-    - `publishFighter` on a fighter with one `verified` evidence row succeeds, and `publication_status` becomes `'published'`.
+    - `publishFighter` on a fighter with one `verified`, `confidence: 'high'` (or `'medium'`) evidence row succeeds, and `publication_status` becomes `'published'`.
+    - `publishFighter` on a fighter whose only evidence is `verified` but `confidence: 'low'` fails — confirms the confidence floor is actually enforced, not just the verification status.
     - `deleteFighterEvidence` removing a published fighter's *only* qualifying evidence row reverts `publication_status` to `'draft'` in the same transaction.
     - `deleteFighterEvidence` removing one of *several* qualifying evidence rows leaves `publication_status` as `'published'` (only reverts when the last one goes).
-    - `deleteFighterEvidence` on a non-qualifying (e.g. `unverified`) evidence row belonging to a published fighter that still has other qualifying evidence does not change `publication_status`.
+    - `deleteFighterEvidence` on a non-qualifying (e.g. `unverified`, or `verified` with `confidence: 'low'`) evidence row belonging to a published fighter that still has other qualifying evidence does not change `publication_status`.
+    - Concurrency: two near-simultaneous calls — one `publishFighter`, one `deleteFighterEvidence` targeting the same fighter's last qualifying row — don't race to an inconsistent end state (a `published` fighter with zero qualifying evidence). Exercise this by starting both within the same test against real Postgres and asserting the final state is consistent (either published with evidence intact, or draft with the evidence gone) rather than the broken in-between.
 
 11. **Extend CI.** Add to the existing `.github/workflows/ci.yml` job: a `postgres:16-alpine` service container, then after `pnpm build`:
     ```yaml
@@ -284,11 +290,11 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 
 ### Files touched — 1B
 
-`drizzle.config.ts`, `src/db/schema/*.ts`, `src/db/migrations/*` (generated), `src/db/client.ts`, `src/db/services/fighter-publication.ts`, `src/db/services/fighter-publication.test.ts`, `src/db/fixtures/dev/*.ts`, `src/db/fixtures/production/README.md`, `src/db/seed.ts`, `src/db/schema.test.ts`, `vitest.config.ts`, updates to `package.json` and `.github/workflows/ci.yml`
+`drizzle.config.ts`, `src/db/schema/*.ts`, `src/db/migrations/*` (generated), `src/db/client.ts`, `src/modules/fighters/services/publication.ts`, `src/modules/fighters/services/publication.test.ts`, `src/db/fixtures/dev/*.ts`, `src/db/fixtures/production/README.md`, `src/db/seed.ts`, `src/db/schema.test.ts`, `vitest.config.ts`, updates to `package.json` and `.github/workflows/ci.yml`
 
 ### Model routing — 1B
 
-🔴 **Strong model:** schema definition (constraints, FKs, enum shapes, the evidence-table design), the `fighter-publication.ts` transaction logic (the auto-revert-on-delete case is easy to get subtly wrong), migration review before committing, the CI Postgres wiring, and the constraint-violation tests (getting these subtly wrong defeats their purpose).
+🔴 **Strong model:** schema definition (constraints, FKs, enum shapes, the evidence-table design), `publication.ts`'s transaction and locking logic (the auto-revert-on-delete and race-condition cases are easy to get subtly wrong), migration review before committing, the CI Postgres wiring, and the constraint-violation tests (getting these subtly wrong defeats their purpose).
 🟢 **Cheap model:** fictional fixture data entry (once the schema shape is fixed), the seed script's mechanical insert-in-order logic, the `production/README.md` stub.
 
 ---
@@ -372,7 +378,7 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 - ✅ Migrations never run automatically from app boot or a deploy hook — only via explicit `pnpm db:migrate`.
 - ✅ Exactly one integration-test strategy is in use (CI Postgres service + local Compose test database) — no Testcontainers.
 - ✅ No Postgres trigger or CHECK constraint enforces the publish invariant — Slice 1B enforces it entirely in the service layer, by design.
-- ✅ The codebase shape (`src/modules/fighters/queries.ts`, `src/db/schema/*`, `src/db/services/*`, fixture/production split) is ready for Slice 2 to extend without rework.
+- ✅ The codebase shape (`src/modules/fighters/queries.ts`, `src/modules/fighters/services/*`, `src/db/schema/*`, fixture/production split) is ready for Slice 2 to extend without rework.
 
 ---
 
@@ -389,7 +395,7 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 | CI Postgres service wiring | 🔴 Strong |
 | Constraint-violation and cascade-delete tests | 🔴 Strong |
 | First query function + its integration test (sets the precedent) | 🔴 Strong |
-| `fighter-publication.ts` transaction logic + its tests (the auto-revert-on-delete case) | 🔴 Strong |
+| `publication.ts` transaction/locking logic + its tests (auto-revert-on-delete, race conditions) | 🔴 Strong |
 
 **Rule of thumb carried over from ROADMAP.md:** the first instance of a pattern goes to the strong model; once a pattern is established (e.g., the second query module in Slice 2), repetitions can go to the cheap model.
 
