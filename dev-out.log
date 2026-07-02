@@ -1,0 +1,10 @@
+
+> punchstats@0.1.0 dev C:\Users\darar\OneDrive\Documents\GitHub\PunchStats
+> next dev
+
+▲ Next.js 16.2.10 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.0.105:3000
+✓ Ready in 1398ms
+
+ GET /fighters 200 in 722ms (next.js: 571ms, application-code: 151ms)
