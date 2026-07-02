@@ -137,9 +137,10 @@ Full field lists and worked examples (conflict storage, canonical-value selectio
 
 **Tradeoffs accepted:**
 
-- Removing `source_id NOT NULL` from `fighters` means the database no longer guarantees every fighter row has a citation — that guarantee moves to the service layer (the fighter-creation transaction must insert the fighter row and at least one `fighter_evidence` row together). This is a real, accepted cost of supporting multiple independently-verifiable sources per entity.
+- Removing `source_id NOT NULL` from `fighters` means the database no longer guarantees every fighter row has a citation at *creation* time — that guarantee is redirected to *publication* time instead, via the fighter publication-state model in [ADR-014](#adr-014--fighter-publication-state-gates-the-missing-citation-invariant). This is a real, accepted cost of supporting multiple independently-verifiable sources per entity.
 - Every future Tier 2 entity (`bouts`, `events`) needs its own evidence table, migration, and query helpers, rather than reusing one universal table. Judged cheap relative to the referential-integrity loss of the polymorphic alternative.
-- `verified_by` on `fighter_evidence` is free text, not a FK, because `admin_users` doesn't exist until Slice 7. A follow-up migration should convert it to `verified_by_admin_user_id` once multi-admin auth ships.
+- `verified_by` on `fighter_evidence` is free text, not a FK, because `admin_users` doesn't exist until Slice 7. It is an intentional audit snapshot of the reviewer's name, not a placeholder: when Slice 7 adds `admin_users`, a nullable `verified_by_admin_user_id` column is added *alongside* it, not as a replacement — the historical text should survive an account being renamed or removed.
+- `confidence` on `fighter_evidence` is `NOT NULL` with no database default — every evidence row must state its confidence explicitly at creation; there is no silent "unset" state.
 
 **Consequences:**
 
@@ -154,3 +155,40 @@ Full field lists and worked examples (conflict storage, canonical-value selectio
 - The number of `<entity>_evidence` tables exceeds ~6–7 → reconsider the shared-registry/anchor-table alternative (rejected above, not ruled out permanently).
 - Community submissions (post-MVP) need to attach evidence to more granular objects than "one field on one entity" (e.g., disputing a single sentence within a bio) → revisit whether `field_name` needs to become more structured than a flat text column.
 - If `fighter_evidence` in practice is never populated with more than one row per field even for real, multi-sourced data → that would suggest the tiering assumption was wrong for `fighters` specifically, and Tier 1's simpler shape might have sufficed there too.
+
+## ADR-014 — Fighter publication state gates the missing-citation invariant
+
+**Status:** Accepted
+
+**Why:** [ADR-013](#adr-013--tiered-provenance-per-domain-evidence-tables-over-row-level-or-fully-generic-models) removed `source_id NOT NULL` from `fighters`, which was an honest tradeoff but left a real gap: nothing stops a fighter from existing — and being shown publicly — with zero supporting evidence. That gap needs a replacement guarantee, and the replacement also needs to solve a workflow problem the old model never had: admins should be able to save an incomplete profile mid-entry without either faking a citation to satisfy a NOT NULL column or being blocked from creating the row at all.
+
+**Decision:** add `fighters.publication_status` (`draft` | `published` | `archived`, `NOT NULL DEFAULT 'draft'`). A fighter may be created and edited freely in `draft` with zero evidence. Transitioning to `published` requires at least one `fighter_evidence` row with `verification_status = 'verified'` — enforced by a `publishFighter(fighterId)` service function running the check and the state change in one transaction, not by a database constraint. Deleting a fighter's last qualifying evidence row while it is `published` auto-reverts it to `draft` in the same transaction (via `deleteFighterEvidence(evidenceId)`), rather than blocking the delete. Public queries (`listFighters()`, and later every other public read path) filter to `publication_status = 'published'` only.
+
+Full mechanics, the two service functions, and the enforcement boundary are specified in [DATABASE.md](DATABASE.md#resolving-the-missing-citation-invariant-fighter-publication-state); this ADR records the decision and alternatives.
+
+**Alternatives considered:**
+
+1. *Do nothing — accept the gap as documented but unenforced* — rejected: "a fighter can be created with zero evidence" was flagged as an accepted tradeoff in ADR-013, but leaving it completely unenforced would mean the product's core promise (every displayed fact is sourced) has no actual guarantee behind it, only a convention.
+2. *Re-add a NOT NULL source column to `fighters`, in some form* — rejected: this is exactly what ADR-013 already rejected, and for the same reason — it re-imposes "one citation for the whole row" on a genuinely multi-sourced entity, or forces a placeholder citation at creation time that misrepresents an incomplete profile as sourced.
+3. *A Postgres CHECK constraint or trigger enforcing "published implies at least one verified evidence row" at the database level* — rejected for now, not permanently: a trigger is the more airtight guarantee, but writing and testing one correctly (handling inserts, updates, and the evidence-deletion cascade case) is nontrivial, and Slice 1B's brief is explicitly to avoid introducing that complexity without a clean, well-tested implementation already in hand. Recorded below as the intended hardening step if service-layer discipline ever proves insufficient.
+4. *Reject deletion of a published fighter's last qualifying evidence, instead of auto-reverting to draft* — considered as the enforcement policy for `deleteFighterEvidence`. Rejected: it blocks a legitimate admin action (removing evidence later judged wrong or mistaken) unless a replacement is published first, which is more friction than the alternative of quietly unpublishing the fighter until new qualifying evidence exists. Auto-revert was chosen instead.
+5. *Require verified evidence for every individual field before publishing, not just one row anywhere on the fighter* — considered as a stricter eligibility rule. Rejected for Slice 1B as unnecessary complexity: it requires defining which fields are "required" per fighter (birth date? nationality? both?), which is a real product decision not yet made. The single-verified-row bar is a deliberately low floor, not the final word — recorded as a revisit trigger below.
+
+**Tradeoffs accepted:**
+
+- The invariant is enforced only for writes that go through `publishFighter`/`deleteFighterEvidence` — a direct `UPDATE fighters SET publication_status = 'published'` bypassing the service layer is not stopped by the database. Accepted because this codebase's convention is that all writes go through the service layer already (see [ARCHITECTURE.md](ARCHITECTURE.md)); this is not a new category of trust being extended.
+- `archived` is added to the enum now for completeness (so `draft`/`published`/`archived` don't need a later migration to introduce a third state), even though no workflow transitions a fighter into it until Slice 7. A small amount of speculative schema, judged cheap relative to an enum-value migration later.
+
+**Consequences:**
+
+- `fighters` gains `publication_status` (Slice 1B migration).
+- Two new service functions ship in Slice 1B: `publishFighter` and `deleteFighterEvidence`, in `src/db/services/fighter-publication.ts`, both integration-tested.
+- `listFighters()` (Slice 1C) filters to `publication_status = 'published'`; Slice 1B's fixtures need at least one fixture fighter in each of `draft` and `published` state (the published one carrying a qualifying `fighter_evidence` row) so both the write-side invariant and the read-side filter are exercised by real data, not asserted in the abstract.
+
+**Migration implications:** none yet — lands as part of Slice 1B's initial migration, alongside ADR-013's tables. No populated data exists to backfill.
+
+**Revisit triggers:**
+
+- If the single-verified-row bar for publishing proves too permissive in practice (e.g., a fighter gets published on the strength of one trivial verified fact while its birth date and record remain entirely unsourced) → introduce a stricter, field-specific eligibility rule (see alternative 5 above).
+- If direct-write bypasses of `publishFighter`/`deleteFighterEvidence` are ever observed or become a real risk (e.g., once ingestion adapters or bulk-import tooling write directly to `fighters`) → build the Postgres trigger described in alternative 3, converting this from a service-layer convention into a database guarantee.
+- If `archived` needs its own eligibility rules or admin workflow before Slice 7 arrives naturally → revisit whether it should have shipped later instead of speculatively now.

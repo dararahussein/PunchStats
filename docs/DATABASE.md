@@ -79,9 +79,9 @@ CREATE TABLE fighter_evidence (
   source_document_id   uuid NOT NULL REFERENCES source_documents(id),
   source_value         text,                -- the value as that source reported it, verbatim
   verification_status  verification_status NOT NULL DEFAULT 'unverified',
-  confidence           confidence_level,    -- editor's trust in this specific claim — independent of verification_status
+  confidence           confidence_level NOT NULL,  -- no default — every insert must choose explicitly; see definitions below
   notes                text,
-  verified_by          text,                -- free text for now; becomes a FK to admin_users once that table exists (Slice 7)
+  verified_by          text,                -- audit snapshot of the reviewer's name at the time — not an identity reference; see note below
   verified_at          timestamptz,
   created_at           timestamptz NOT NULL DEFAULT now(),
   updated_at           timestamptz NOT NULL DEFAULT now()
@@ -91,7 +91,15 @@ CREATE INDEX fighter_evidence_fighter ON fighter_evidence (fighter_id);
 CREATE INDEX fighter_evidence_source  ON fighter_evidence (source_document_id);
 ```
 
-`verified_by` is free text rather than a foreign key because `admin_users` doesn't exist until Slice 7 — a follow-up migration should add `verified_by_admin_user_id` once multi-admin auth ships, backfilling from the free-text values where possible. Flagged here so it isn't forgotten.
+**`confidence` has no database default** and is `NOT NULL` — every `fighter_evidence` insert must choose one of the three values explicitly; there is no silent "unset" state. Definitions:
+
+- **`high`** — supported by an authoritative or directly verifiable source (an athletic commission license, an official sanctioning body record, a primary document).
+- **`medium`** — supported by a credible secondary source, or partially corroborated information (a reputable outlet's report that hasn't been cross-checked against a primary source).
+- **`low`** — uncertain, conflicting, incomplete, or awaiting confirmation.
+
+`confidence` is deliberately kept separate from `verification_status`: **confidence describes the evidence's quality** (how good is this source, independent of process), while **verification status describes the editorial workflow** (has anyone reviewed this claim, and did they confirm or dispute it). A `verified` claim can still be `confidence = 'low'` if it's the best source available and an editor signed off on it anyway; an `unverified` claim can already look `high` confidence before anyone's gotten around to reviewing it.
+
+`verified_by` is free text, not a foreign key, and that is deliberate rather than a placeholder to fix later: it's an **audit snapshot** of who confirmed the claim, by name, at the time — not a live reference to an authenticated account. `admin_users` doesn't exist until Slice 7; when it ships, add a nullable `verified_by_admin_user_id` column **alongside** `verified_by`, not instead of it. Keeping the free-text field even after the FK exists is intentional: the historical record of "who reviewed this, as their name appeared then" should survive an account being renamed, deactivated, or removed later, which is exactly what an audit trail is for.
 
 ### Why per-domain evidence tables, not one generic polymorphic table
 
@@ -127,7 +135,7 @@ For Tier 2 fields: a correction is a **new** `fighter_evidence` row citing the n
 
 - **Provenance** — *where did this value come from?* Answered by the `source_document_id` link (and, for Tier 2 fields, `source_value` holding the value exactly as that source reported it, which may differ in format or units from the canonical column).
 - **Verification status** — *how much should the reader trust this specific claim, and has anyone reviewed it?* A property of the evidence row (Tier 2) or the fact row itself (Tier 1) — the same source document can back one `verified` fact and one `disputed` fact.
-- **Confidence** — *independent of review workflow, how sure is the editor this specific claim is accurate?* Only meaningful on Tier 2 evidence rows, where a single fact might be reviewed (`verified`) yet still come from a source the editor personally finds shaky (`confidence = 'low'`) with nothing better available.
+- **Confidence** — *independent of review workflow, how sure is the editor this specific claim is accurate?* Only meaningful on Tier 2 evidence rows, where a single fact might be reviewed (`verified`) yet still come from a source the editor personally finds shaky (`confidence = 'low'`) with nothing better available. Required on every row (`NOT NULL`, no default) — see the definitions above.
 - **Licensing** — *are we legally allowed to reuse this source's content?* Lives entirely on `source_documents` (`license_name`, `license_url`, `license_notes`), because a license is a property of the source material itself, applying uniformly to everything cited from it — not a property of any individual fact extracted from it.
 
 ### How calculated values reference their input evidence
@@ -146,7 +154,30 @@ Even a fact with no external citation — an editor's own judgment call, like wh
 
 Slice 1B ships exactly `source_documents` and `fighter_evidence` — the only Tier 2 entity that exists yet is `fighters`. Every Tier 1 table described in this document (`scorecards`, `punch_stats`, `rankings`, `title_reigns`, `bout_result_revisions`) is specified with its future `source_document_id`/`verification_status` columns for consistency, but none of those tables are built until the slice that introduces them (3, 5, or 6 — see [ROADMAP.md](ROADMAP.md)). `fighter_aliases` *does* ship in Slice 1B (below) and gets its Tier 1 columns now, even though Slice 1B's fixtures are fictional and won't populate them meaningfully yet.
 
-**A tradeoff worth naming:** removing `source_id NOT NULL` from `fighters` means the database itself no longer guarantees every fighter has a citation — that guarantee now lives at the service layer (the fighter-creation transaction should insert the fighter row and at least one general `fighter_evidence` row together) rather than as a SQL constraint. This is the accepted cost of supporting multiple, independently-verifiable sources per entity; it did not exist as a real risk under the old model only because the old model couldn't express multiple sources at all.
+**A tradeoff worth naming:** removing `source_id NOT NULL` from `fighters` means the database itself no longer guarantees every fighter has a citation — that guarantee now lives at the service layer, resolved below by making publication (not creation) the gate that requires evidence.
+
+### Resolving the missing-citation invariant: fighter publication state
+
+Removing a NOT NULL source column doesn't mean the "no fighter appears without a citation" promise gets dropped — it means the promise moves from *creation time* to *publication time*, via an explicit state column rather than a stricter insert constraint. This also solves a real workflow problem the old model didn't have to deal with: profiles legitimately start incomplete, and an admin should be able to save partial work without either faking a citation or being blocked from creating the row at all.
+
+```sql
+CREATE TYPE fighter_publication_status AS ENUM ('draft', 'published', 'archived');
+```
+
+Added to `fighters`: `publication_status fighter_publication_status NOT NULL DEFAULT 'draft'`.
+
+- **`draft`** — the fighter exists and is editable, but is not shown on any public page or returned by any public query. Admins can build a profile incrementally — add vitals, add evidence, come back later — without the database (or a premature publish) ever pretending an unsourced profile is finished. A draft fighter may have zero `fighter_evidence` rows.
+- **`published`** — visible publicly. **Eligibility rule:** a fighter may only transition to `published` if it has at least one `fighter_evidence` row with `verification_status = 'verified'` (whole-fighter or a specific field — either counts as "this fighter has at least one editorially confirmed fact"). This is deliberately a low, single bar for Slice 1B, not a per-field completeness check ("birth date AND nationality must both be verified") — a finer-grained rule is a reasonable future hardening step, not required to resolve the invariant this section exists to fix.
+- **`archived`** — excluded from public queries like `draft`, for fighters retired from public display (e.g., a duplicate record merged into another). Introduced here for completeness; no admin workflow transitions a fighter into this state until Slice 7 builds admin tooling.
+
+**Enforcement is service-layer, not a database constraint or trigger.** Two functions carry the invariant, each a single transaction, living in `src/db/services/fighter-publication.ts` (built in Slice 1B — see [SLICE_1_FOUNDATION.md](SLICE_1_FOUNDATION.md)):
+
+- **`publishFighter(fighterId)`** — inside one transaction, checks for at least one qualifying (`verified`) `fighter_evidence` row for that fighter; if none exists, the transaction rolls back and the caller gets a typed failure (no partial state change is possible). If one exists, sets `publication_status = 'published'`.
+- **`deleteFighterEvidence(evidenceId)`** — deletes the evidence row; if the fighter it belonged to is currently `published` and this was its last qualifying evidence row, the same transaction also sets that fighter's `publication_status` back to `'draft'`. **Policy choice: auto-revert, not reject-the-delete.** An admin correcting a mistaken piece of evidence shouldn't be blocked from deleting it; the fighter simply — and visibly, via its own `publication_status` — stops being publicly displayed until new qualifying evidence is added. Rejecting the delete would force admins to publish a replacement fact first or route around the rule entirely, which is worse than quietly unpublishing.
+
+No CHECK constraint or trigger enforces this at the database level in Slice 1B — a direct `UPDATE fighters SET publication_status = 'published'` issued outside these two functions could bypass the rule. That's an accepted gap for Slice 1B, consistent with this codebase's convention that all writes go through the service layer (see [ARCHITECTURE.md](ARCHITECTURE.md)'s module boundaries) rather than being reached for directly. **Future hardening, not built now:** a Postgres trigger (`BEFORE UPDATE ... WHEN (NEW.publication_status = 'published' AND OLD.publication_status IS DISTINCT FROM 'published')`, checking for a qualifying evidence row) could turn this into a real database guarantee if service-layer discipline ever proves insufficient — deferred because a hand-rolled trigger is exactly the kind of complexity Slice 1B should avoid introducing without a clean, well-tested implementation already in hand.
+
+**Public queries filter on this column:** `listFighters()` (Slice 1C) is `WHERE publication_status = 'published'` — draft and archived fighters exist in the database and are editable, but are invisible to every public read path.
 
 ## Tables
 
@@ -181,8 +212,9 @@ Seeded once (17 men's + women's divisions); effectively static reference data. N
 | `bio` | text | markdown, short |
 | `photo_key`, `photo_license`, `photo_attribution` | text | all-or-nothing (app-enforced) |
 | `sex` | enum | must match divisions fought in (app-enforced) |
+| `publication_status` | enum `draft` \| `published` \| `archived`, NOT NULL DEFAULT `draft` | gates public visibility; see "Resolving the missing-citation invariant" above |
 
-**No direct provenance columns.** `fighters` is a Tier 2 multi-field entity — citations live in `fighter_evidence` (see "Provenance and evidence model" above), not on this row.
+**No direct provenance columns.** `fighters` is a Tier 2 multi-field entity — citations live in `fighter_evidence` (see "Provenance and evidence model" above), not on this row. Note `status` (career status: active/inactive/retired/deceased) and `publication_status` (draft/published/archived) are two independent columns answering two different questions — a retired fighter can be published, and an active fighter can still be a draft.
 
 ### `fighter_aliases`
 
