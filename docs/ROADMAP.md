@@ -10,14 +10,16 @@ Eight vertical slices. Each slice ships something visible, touches database → 
 
 ## Slice 1 — Foundation & database core
 
-**Goal:** running skeleton: Next.js + Tailwind + shadcn + Drizzle + Dockerized Postgres + core schema + seed + deployed to Vercel/Neon.
+**Goal:** running skeleton: Next.js + Tailwind + shadcn + Drizzle + Dockerized Postgres + core schema + seed + a read-only fighter directory. **Full detail lives in [SLICE_1_FOUNDATION.md](SLICE_1_FOUNDATION.md)** — split into three independently-shippable sub-slices:
 
-- **DB:** migrations 0000–0002: extensions (`pg_trgm`, `unaccent` + immutable wrapper), enums, `sources`, `weight_classes`, `fighters`, `fighter_aliases` with indexes; seed script (all divisions, 3 sources, ~10 hand-verified fighters).
-- **Backend:** db client wiring (Neon serverless in prod / node-postgres locally), `modules/fighters/queries.ts` with `getFighterBySlug`, `listFighters`; slug generation util.
-- **Frontend:** app shell (top bar, footer, dark tokens, fonts), placeholder home page listing seeded fighters, `/dev/components` page with `FighterAvatar`, `RecordDisplay`, `ResultPill` stubs.
-- **Tests:** CI pipeline green; unit tests for slug util + one query test against real Postgres proving the trigram index is used (`EXPLAIN` sanity check).
-- **Acceptance:** `docker compose up && pnpm dev` works from a fresh clone in <5 min; production URL serves the shell; migrations apply via CI, not at app boot.
-- **Routing:** 🔴 schema DDL review + db client/env wiring · 🟢 scaffold, tokens, seed data entry, component stubs.
+- **1A — Scaffold & local infra:** Next.js + Tailwind v4 + shadcn/ui init + fonts + Docker Compose Postgres + CI skeleton. No schema, no pages beyond a placeholder.
+- **1B — Schema, migrations, fixtures, tests:** Drizzle schema for `weight_classes`, `fighters`, `fighter_aliases`, plus `source_documents` and `fighter_evidence` (a per-domain evidence table, not a single `source_id` column per row and not a generic polymorphic table — see [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting) and ADR-013 in [DECISIONS.md](DECISIONS.md), which supersede ADR-005's row-level provenance for multi-field entities). `fighters` also gets a `publication_status` (`draft`/`published`/`archived`) column, gated by two service-layer functions (`publishFighter`, `deleteFighterEvidence`) that enforce "no fighter is publicly visible without at least one verified evidence row" without a database trigger (see ADR-014). Fictional, deterministic dev fixtures only — real fighter data is explicitly deferred to a separate curated workflow. One integration-test strategy (CI Postgres service + local Compose test DB), no Testcontainers.
+- **1C — Read-only fighter directory:** `listFighters()` query, filtered to `publication_status = 'published'` (no `getFighterBySlug`, no pagination yet) + a plain `/fighters` page reading seeded fixtures.
+
+Vercel/Neon/R2 deployment, `pg_trgm`/`unaccent`/fuzzy search, and fighter-detail queries are deferred out of Slice 1 entirely (see SLICE_1_FOUNDATION.md's "Deferred work" section) — they land in Slices 2–3.
+
+- **Acceptance:** `pnpm install && pnpm setup && pnpm dev` works from a fresh clone in <5 min and renders `/fighters`; migrations are generated (never hand-edited) and applied only via explicit `pnpm db:migrate`, never at app boot or a deploy hook.
+- **Routing:** 🔴 schema/constraint design, migration review, CI Postgres wiring, first query function · 🟢 scaffold, tokens, CI skeleton, fictional fixture entry, page assembly.
 
 ## Slice 2 — Fighter search & directory
 

@@ -62,10 +62,15 @@ Collections:
     "record": { "wins": 42, "losses": 0, "draws": 0, "noContests": 0, "koWins": 31, "provenance": "calculated" },
     "currentTitles": [{ "body": "WBA", "name": "WBA World Super Middleweight", "since": "2025-09-13" }],
     "photo": { "url": "…", "attribution": "…", "license": "CC BY-SA 4.0" },
-    "provenance": { "verificationStatus": "verified", "source": { "name": "…", "kind": "media_report" } }
+    "evidence": {
+      "birthDate": { "verificationStatus": "verified", "source": { "publisher": "Nevada Athletic Commission", "sourceType": "official" } },
+      "nationality": { "verificationStatus": "unverified", "source": null }
+    }
   }
 }
 ```
+
+`evidence` is keyed by field name and reflects the `fighter_evidence` model in [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting): fighters are a multi-field entity, so provenance is per-field, not a single object for the whole fighter. A field with no evidence rows yet (`source: null`) still renders, just with an "unverified" badge — never omitted.
 
 `GET /api/v1/bouts/{id}` (abridged):
 
@@ -138,7 +143,7 @@ No `401/403` on the public API (it's read-only public). Server actions don't use
 
 ## Admin operations (Server Actions)
 
-Every action: (1) asserts a valid admin session (middleware is not the security boundary — each action re-checks), (2) parses input with the module's Zod schema, (3) runs the service in a transaction, (4) calls `revalidateTag()` for every affected entity, (5) writes provenance (`source_id`, `verification_status` are required form fields).
+Every action: (1) asserts a valid admin session (middleware is not the security boundary — each action re-checks), (2) parses input with the module's Zod schema, (3) runs the service in a transaction, (4) calls `revalidateTag()` for every affected entity, (5) writes provenance — for Tier 1 tables (scorecards, punch stats, rankings, etc.) `source_document_id` + `verification_status` are required form fields directly on the row; for Tier 2 entities (fighters, and later events/bouts) the action must insert an accompanying evidence row (`fighter_evidence`, etc.) in the same transaction as the entity write. See [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting) for the full model.
 
 | Module | Actions (representative) | Cache tags revalidated |
 |---|---|---|
