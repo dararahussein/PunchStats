@@ -41,7 +41,7 @@ Assumption: users are anonymous readers. There are **no public accounts in the M
 - **Event directory**: upcoming and past, filterable by date and country.
 - **Division rankings**: per weight class, editorial top-10 + champion(s) by sanctioning body, with an "as of" date and methodology note.
 - **Global search** for fighters and events with typo tolerance.
-- **Admin tools** (auth-protected): CRUD for all of the above, with provenance fields (source + verification status) required on every record.
+- **Admin tools** (auth-protected): CRUD for all of the above, with a source citation and verification status required on every record — one citation per row for single-fact tables (e.g. scorecards), and per-field citations for multi-source entities (e.g. fighters) — see [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting).
 - **Data provenance surfaced in the UI**: small badges/footnotes distinguishing verified / user-submitted / calculated data.
 - **SEO**: server-rendered pages, canonical URLs with slugs, OpenGraph images, structured data (`Person`, `SportsEvent`) where it fits.
 

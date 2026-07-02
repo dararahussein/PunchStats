@@ -48,11 +48,11 @@ One Next.js App Router application containing UI, admin, public API, and all bus
 
 ## ADR-005 — Row-level provenance, not field-level
 
-**Status:** Provisional — revisit when community submissions require per-field merge/review.
+**Status:** Superseded by [ADR-013](#adr-013--tiered-provenance-per-domain-evidence-tables-over-row-level-or-fully-generic-models) — the row-level `source_id` model didn't hold up once multi-field entities like `fighters` needed to cite more than one source per row. Retained here for history, per this document's own rule that superseded decisions are marked, not deleted.
 
-**Why:** `source_id` + `verification_status` per row covers the product promise (badging verified/user-submitted/calculated) at 1/10th the complexity of field-level lineage. Calculated values are structurally separate (denormalized columns / derived in services), so "calculated" needs no row status.
+**Original reasoning:** `source_id` + `verification_status` per row covers the product promise (badging verified/user-submitted/calculated) at 1/10th the complexity of field-level lineage. Calculated values are structurally separate (denormalized columns / derived in services), so "calculated" needs no row status.
 
-**Alternatives rejected:** *field-level provenance tables* (huge write amplification, no UI to justify it) · *no provenance until later* (retrofitting NOT NULL source columns onto populated tables is miserable; the columns must exist from row one).
+**Original alternatives rejected:** *field-level provenance tables* (huge write amplification, no UI to justify it) · *no provenance until later* (retrofitting NOT NULL source columns onto populated tables is miserable; the columns must exist from row one).
 
 ## ADR-006 — Minimal custom admin auth (one credential, signed cookie)
 
@@ -113,3 +113,44 @@ Publishing rankings inserts a complete new `as_of` set per division; nothing is 
 **Why:** UUIDv7 is time-ordered (avoids the index-locality pain of v4) and lets seed scripts and future importers generate IDs without round-trips; slugs carry all public URL duty so IDs never leak into UX. Bouts, having no natural name, use `/fights/{uuid}/{derived-slug}` URLs.
 
 **Alternatives rejected:** *bigserial* (fine, but couples ID generation to the DB and leaks ordinals) · *slugs as PKs* (slugs must be renameable — fighters change ring names; PKs must not change).
+
+## ADR-013 — Tiered provenance: per-domain evidence tables over row-level or fully generic models
+
+**Status:** Accepted — supersedes [ADR-005](#adr-005--row-level-provenance-not-field-level)'s row-level provenance decision.
+
+**Why it was revisited:** ADR-005's design conflated two very different kinds of table. A `scorecards` row genuinely is one atomic fact from one source — row-level provenance is correct there. But `fighters` aggregates dozens of independently-sourced facts (birth date from a commission license, reach from a promoter's press kit, a photo from Wikimedia Commons) collected at different times. A single `source_id` on that row forces every field to share one citation, so either a later, better source for one field silently overwrites the citation for all the others, or admins pick whichever source happens to be "best enough" and misrepresent the rest. That's not a hypothetical edge case — it's the normal case for any fighter profile assembled from more than one source.
+
+**New decision — a two-tier model:**
+
+- **Tier 1 (atomic-fact tables — unchanged in shape from ADR-005):** `fighter_aliases`, `scorecards`, `punch_stats`, `rankings`, `title_reigns`, `bout_result_revisions` keep a direct `source_document_id` + `verification_status` pair, because a row in these tables really is one fact from one source. Only the target table changes — `source_documents` (below) replaces the original thin `sources` table.
+- **Tier 2 (multi-field entities):** `fighters` now, `events`/`bouts` once they exist, carry **no** source/verification columns at all. A companion `<entity>_evidence` table (`fighter_evidence` first, in Slice 1B) holds one row per claim about one field (or the entity generally, via a nullable `field_name`), so independently-sourced, possibly-conflicting facts about the same entity coexist instead of competing for one column.
+- **Source documents, not source publishers:** `sources` is replaced by `source_documents`, where each row is one specific retrieved document (a particular article, report, or filing — with its own `url`, `published_at`, `retrieved_at`, `archived_url`), not a generic stand-in for a publisher. The same outlet gets a new row per distinct document cited.
+
+Full field lists and worked examples (conflict storage, canonical-value selection, corrections, editorial entries, archived URLs) are in [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting) — this ADR records the decision and its alternatives, not the schema.
+
+**Alternatives considered:**
+
+1. *Keep ADR-005's row-level model everywhere* (do nothing) — rejected: doesn't fix the problem this ADR responds to; every Tier 2 entity would still misrepresent multi-source facts.
+2. *Full field-level provenance everywhere, including Tier 1 tables* — rejected: a `scorecards` row is already atomic; giving it a full evidence side-table adds a join and a table for a distinction that table structurally can't have (there's only one fact in the row). This was ADR-005's original objection to field-level provenance in general — it still holds, just narrowed to the tables where it actually applies (Tier 2).
+3. *One generic polymorphic `entity_evidence` table with `entity_type` + `entity_id` columns, shared by every Tier 2 entity* — this was the first sketch of this fix. Rejected in favor of per-domain tables: Postgres cannot enforce a real foreign key across a polymorphic `(entity_type, entity_id)` pair, so referential integrity and cascade deletes become application-level promises instead of database guarantees — a real regression on a schema whose entire design philosophy elsewhere is "let Postgres enforce it" (CHECK constraints, NOT NULL, unique indexes throughout DATABASE.md). The cost of the alternative — one small, near-identical table per Tier 2 entity — is low and mechanical with Drizzle's schema-as-code migrations.
+4. *A shared "anchor"/registry table* (every Tier 2 entity also gets a row in a central `provenance_subjects` table; both the entity table and one generic evidence table FK to that registry's surrogate key) — this would preserve real referential integrity with only one physical evidence table. Rejected for now: it requires an extra insert and an extra join for every Tier 2 entity, to save table-count duplication that doesn't matter until there are many more Tier 2 entity types than this project has (currently one: `fighters`). Recorded as the escalation path if the number of `<entity>_evidence` tables grows past roughly six or seven and the per-table duplication becomes the bigger cost than the registry indirection.
+
+**Tradeoffs accepted:**
+
+- Removing `source_id NOT NULL` from `fighters` means the database no longer guarantees every fighter row has a citation — that guarantee moves to the service layer (the fighter-creation transaction must insert the fighter row and at least one `fighter_evidence` row together). This is a real, accepted cost of supporting multiple independently-verifiable sources per entity.
+- Every future Tier 2 entity (`bouts`, `events`) needs its own evidence table, migration, and query helpers, rather than reusing one universal table. Judged cheap relative to the referential-integrity loss of the polymorphic alternative.
+- `verified_by` on `fighter_evidence` is free text, not a FK, because `admin_users` doesn't exist until Slice 7. A follow-up migration should convert it to `verified_by_admin_user_id` once multi-admin auth ships.
+
+**Consequences:**
+
+- DATABASE.md's provenance section, every Tier 1/Tier 2 table spec, the ER diagram, and the indexes list are updated to match (done alongside this ADR).
+- Any doc or code that assumed a single `source_id` column on `fighters`/`events`/`bouts` (API.md's response-shape examples, admin server-action descriptions) needs to describe evidence-aware provenance instead — corrected where found in this pass; flag anything missed for follow-up.
+- Slice 1B (see [SLICE_1_FOUNDATION.md](SLICE_1_FOUNDATION.md)) builds exactly `source_documents` + `fighter_evidence`; no other evidence table is built until its parent entity ships.
+
+**Migration implications:** none yet — no production data exists. This decision lands as part of Slice 1B's initial migration, not a schema change against populated tables. The `verified_by` → FK conversion (above) and "add `bout_evidence`/`event_evidence` when their parent tables ship" are the known future migrations this decision commits to.
+
+**Revisit triggers:**
+
+- The number of `<entity>_evidence` tables exceeds ~6–7 → reconsider the shared-registry/anchor-table alternative (rejected above, not ruled out permanently).
+- Community submissions (post-MVP) need to attach evidence to more granular objects than "one field on one entity" (e.g., disputing a single sentence within a bio) → revisit whether `field_name` needs to become more structured than a flat text column.
+- If `fighter_evidence` in practice is never populated with more than one row per field even for real, multi-sourced data → that would suggest the tiering assumption was wrong for `fighters` specifically, and Tier 1's simpler shape might have sufficed there too.

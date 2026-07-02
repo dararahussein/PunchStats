@@ -2,7 +2,7 @@
 
 **Goal:** Prove the stack works end-to-end with the smallest possible surface area. Split into three independently-shippable sub-slices so each can be handed to a coding model as a self-contained task without the model needing to hold the whole foundation in its head at once.
 
-**Architecture note (read before starting 1B):** This revision changes the provenance model described in [DATABASE.md](DATABASE.md) and ADR-005 in [DECISIONS.md](DECISIONS.md). The original design put a single `source_id` + `verification_status` column directly on `fighters`, `weight_classes`, etc. — implying one source explains an entire row. That's wrong: a fighter's birth date, reach, and nationality routinely come from different places. Slice 1B replaces that with a generic `source_documents` + `entity_evidence` model (detailed below). **DATABASE.md and ADR-005 need a follow-up edit to match** — flagged here, not done in this pass, since this document is scoped to Slice 1 only.
+**Architecture note (read before starting 1B):** [DATABASE.md](DATABASE.md) and [ADR-013](DECISIONS.md) (which supersedes ADR-005) now define the canonical provenance model — `source_documents` plus per-domain evidence tables (`fighter_evidence` is the first, built in this slice), replacing the original single `source_id` + `verification_status` column that used to sit directly on `fighters`, `events`, `bouts`, etc. Slice 1B below has been updated to match that canonical model exactly; DATABASE.md is the source of truth if the two ever drift.
 
 **Versioning note:** No package versions are pinned anywhere in this document. Run the install commands as written, let the package manager resolve the current stable release, and commit the resulting lockfile. Record actual installed versions in `package.json` / `pnpm-lock.yaml`, not in prose docs that will rot.
 
@@ -120,34 +120,44 @@
 
 ### The provenance model for this slice
 
-Two tables carry provenance for everything else, instead of a `source_id` column bolted onto every content table:
+Follows the canonical model in [DATABASE.md](DATABASE.md#provenance-and-evidence-model-cross-cutting) (ADR-013 in DECISIONS.md) exactly — summarized here for the implementer. Two tables:
 
 ```
 source_documents
-  id              uuid primary key
-  publisher       text not null        -- "Nevada Athletic Commission", "Wikimedia Commons"
-  title           text
-  url             text
-  published_at    date
-  retrieved_at    date
-  license         text                 -- required for anything image/media-related
-  notes           text
-  created_at      timestamptz not null default now()
+  id             uuid primary key
+  publisher      text not null        -- "Nevada Athletic Commission", "Wikimedia Commons", "PunchStats Editorial"
+  title          text
+  url            text                 -- nullable; some sources have none
+  source_type    source_type not null -- enum: official | media_report | editorial | user_submission | licensed_feed
+  published_at   date
+  retrieved_at   date
+  license_name   text
+  license_url    text
+  license_notes  text                 -- required (app-enforced) for licensed_feed sources and any image
+  archived_url   text                 -- Wayback Machine / archive.today snapshot
+  created_at     timestamptz not null default now()
+  updated_at     timestamptz not null default now()
 
-entity_evidence
-  id                    uuid primary key
-  entity_type           text not null       -- "fighter", "weight_class", "fighter_alias" (extend later)
-  entity_id             uuid not null       -- no FK — deliberately generic across entity types
-  field_name            text not null       -- "birth_date", "reach_cm", "nationality"
-  source_document_id    uuid not null references source_documents(id)
-  source_value          text                -- raw value as reported, for audit when it differs from the stored value
-  verification_status   text not null       -- enum: verified | unverified | user_submitted | disputed
-  created_at            timestamptz not null default now()
+fighter_evidence
+  id                   uuid primary key
+  fighter_id           uuid not null references fighters(id) on delete cascade
+  field_name           text                 -- NULL = whole-fighter claim; else e.g. 'birth_date', 'reach_cm'
+  source_document_id   uuid not null references source_documents(id)
+  source_value         text                 -- the value as that source reported it, verbatim
+  verification_status  verification_status not null default 'unverified'  -- enum: verified | unverified | user_submitted | disputed
+  confidence           confidence_level     -- enum: high | medium | low, nullable
+  notes                text
+  verified_by          text                 -- free text for now; no admin_users table exists until Slice 7
+  verified_at          timestamptz
+  created_at           timestamptz not null default now()
+  updated_at           timestamptz not null default now()
 ```
 
-Index: `(entity_type, entity_id)` on `entity_evidence` for the lookup pattern "give me all evidence for this fighter."
+Indexes: `fighter_evidence (fighter_id)` and `fighter_evidence (source_document_id)`.
 
-This means **`fighters` and `weight_classes` carry no `source_id` or `verification_status` columns at all** — provenance is looked up via `entity_evidence`, not embedded on the row. For Slice 1B, fixtures need not populate `entity_evidence` exhaustively (they're fictional data with nothing to cite) — one or two example rows are enough to prove the join and the constraint shape work. Real coverage arrives with real data, later.
+**Important — this is `fighter_evidence`, not a generic `entity_evidence` table.** DATABASE.md explicitly rejects a shared polymorphic table with `entity_type`/`entity_id` columns, because Postgres can't enforce a real foreign key across such a pair (no referential integrity, no cascade delete). Instead, each Tier 2 entity gets its own evidence table with a real FK — `fighter_evidence` is the first and, for Slice 1B, only one (since `fighters` is the only Tier 2 entity that exists yet). `bout_evidence`/`event_evidence` follow the identical shape when those tables ship in Slices 4–5 — not built now.
+
+This means **`fighters` and `weight_classes` carry no `source_id` or `verification_status` columns at all** — provenance for fighters is looked up via `fighter_evidence`, not embedded on the row (`weight_classes` needs no provenance at all — it's sport-rule reference data, not a sourced fact). For Slice 1B, fixtures need not populate `fighter_evidence` exhaustively (they're fictional data with nothing to cite) — one or two example rows are enough to prove the join and the constraint shape work. Real coverage arrives with real data, later.
 
 ### Tasks
 
@@ -160,11 +170,12 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 2. **Configure Drizzle.** Create `drizzle.config.ts` at the repo root pointing at `src/db/schema/index.ts` and outputting to `src/db/migrations/`, dialect `postgresql`, credentials from `DATABASE_URL`.
 
 3. **Define schema** in `src/db/schema/`:
+   - `enums.ts` — `sourceType`, `verificationStatus`, `confidenceLevel`, `weightClassGenderEnum`, `fighterStanceEnum`, `fighterStatusEnum`, `fighterAliasKindEnum`, all shared across the files below.
    - `source-documents.ts` — table above.
-   - `entity-evidence.ts` — table above, with the verification-status enum shared from a `enums.ts` file (also export `weightClassGenderEnum`, `fighterStanceEnum`, `fighterStatusEnum` here for reuse).
-   - `weight-classes.ts` — `id`, `slug` (unique), `name`, `gender` enum, `limit_lbs` (numeric, nullable — heavyweight has no cap), `sort_order` (smallint).
+   - `fighter-evidence.ts` — table above. Named for the one entity it covers — **not** a generic `entity-evidence.ts` (see the "Important" note above for why).
+   - `weight-classes.ts` — `id`, `slug` (unique), `name`, `gender` enum, `limit_lbs` (numeric, nullable — heavyweight has no cap), `sort_order` (smallint). No provenance columns.
    - `fighters.ts` — `id`, `slug` (unique), `full_name`, `nickname` (nullable), `birth_date` (nullable), `nationality` (char(2), nullable), `stance` enum (nullable), `height_cm`/`reach_cm` (smallint, nullable), `status` enum, `primary_weight_class_id` (fk → weight_classes, nullable), `created_at`/`updated_at`. **No source/verification columns** — see provenance model above. No record-count columns yet (those depend on bouts, which don't exist until Slice 3) — do not add them prematurely.
-   - `fighter-aliases.ts` — `id`, `fighter_id` (fk, cascade delete), `alias`, `kind` enum (`nickname`/`ring_name`/`spelling_variant`/`birth_name`), unique constraint on `(fighter_id, lower(alias))`.
+   - `fighter-aliases.ts` — `id`, `fighter_id` (fk, cascade delete), `alias`, `kind` enum (`nickname`/`ring_name`/`spelling_variant`/`birth_name`), `source_document_id` (fk → source_documents, nullable), `verification_status` enum (default `'unverified'`), unique constraint on `(fighter_id, lower(alias))`. Tier 1 (atomic fact) — direct columns, no separate evidence table.
    - `index.ts` — barrel re-exporting all tables and enums.
 
 4. **Generate the migration.**
@@ -195,8 +206,8 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
    Create `src/db/fixtures/dev/`:
    - `weight-classes.ts` — the 17 real men's divisions with their real weight limits. This is sport-rule reference data (objective, uncontested, not a "fighter fact"), not the kind of data this rule is protecting against — seed it for real.
    - `fighters.ts` — **fictional** fighters only: e.g. `"Test Fighter One"` / slug `test-fighter-1`, `"Jane Example"` / slug `jane-example-boxer`, with made-up but internally-consistent vitals (birth dates, stances, divisions). Use deterministic fixed UUIDs (not `gen_random_uuid()` at insert time) so tests can assert against known IDs.
-   - `fighter-aliases.ts` — one or two fictional aliases per fixture fighter (e.g. "Test Fighter One" → alias "TF1").
-   - `source-documents.ts` / `entity-evidence.ts` — one or two example rows (e.g. a fake "Test Commission Report" source, one evidence row citing it for one fixture fighter's birth date) — enough to prove the shape works, not exhaustive.
+   - `fighter-aliases.ts` — one or two fictional aliases per fixture fighter (e.g. "Test Fighter One" → alias "TF1"), optionally citing the fixture source document below.
+   - `source-documents.ts` / `fighter-evidence.ts` — one or two example rows (e.g. a fake "Test Commission Report" source, one `fighter_evidence` row citing it for one fixture fighter's birth date) — enough to prove the join works, not exhaustive.
    - A top-level comment in this folder: `// Fictional data for local development and automated tests. Do not add real fighters here — see docs/SLICE_1_FOUNDATION.md.`
    - Create `src/db/fixtures/production/` as an **empty folder with a `README.md` stub** stating: "Real, source-reviewed fighter data goes here once the data-entry and provenance workflow is finalized (post-MVP-foundation). Not populated during Slice 1."
 
@@ -213,8 +224,9 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
    Write `src/db/schema.test.ts`:
    - Inserting a weight class, then a fighter referencing it, succeeds.
    - Inserting a fighter alias with a duplicate `(fighter_id, lower(alias))` pair fails (unique constraint).
-   - Deleting a fighter cascades to its aliases.
-   - Inserting `entity_evidence` referencing a nonexistent `source_document_id` fails (FK constraint).
+   - Deleting a fighter cascades to its aliases **and** to its `fighter_evidence` rows (both have `ON DELETE CASCADE` to `fighters`).
+   - Inserting `fighter_evidence` referencing a nonexistent `source_document_id` fails (FK constraint).
+   - Inserting `fighter_evidence` referencing a nonexistent `fighter_id` fails (FK constraint) — this is the referential-integrity guarantee the rejected generic `entity_type`/`entity_id` design couldn't provide.
    - Each test cleans up its own rows (transaction rollback per test, or truncate in `afterEach`) so tests are independent of fixture/seed state.
 
 10. **Extend CI.** Add to the existing `.github/workflows/ci.yml` job: a `postgres:16-alpine` service container, then after `pnpm build`:
@@ -245,7 +257,7 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 - ✅ `pnpm db:migrate` applies cleanly to a fresh `punchstats_test` database.
 - ✅ `pnpm db:seed` populates fictional fixtures without error.
 - ✅ `pnpm test` (schema tests) passes locally and in CI against the Postgres service container.
-- ✅ No table in this slice has a `source_id` or single `verification_status` column directly on it — provenance is only reachable via `entity_evidence`.
+- ✅ `fighters` and `weight_classes` carry no `source_id`/`verification_status` columns — fighter provenance is only reachable via `fighter_evidence`, with a real FK to `fighters(id)` (not a generic `entity_type`/`entity_id` pair).
 - ✅ `src/db/fixtures/dev/` contains zero real fighter names; `src/db/fixtures/production/` exists but is empty except its README stub.
 
 ### Files touched — 1B
@@ -312,11 +324,11 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 - `pg_trgm`, `unaccent`, the immutable-unaccent wrapper function, GIN trigram indexes, fuzzy/typo-tolerant search, and any `EXPLAIN`-based index-usage tests — all Slice 2 (Search)
 - `getFighterBySlug` and any fighter detail/profile page — Slice 3
 - Pagination, filtering, or sorting of any kind
-- Real fighter data of any kind, in any table — a separate curated data-entry workflow starts once DATABASE.md's provenance section is updated to match the `entity_evidence` model introduced here
+- Real fighter data of any kind, in any table — a separate curated data-entry workflow starts once the provenance model in DATABASE.md is used for real citations, not just fictional fixtures
 - shadcn components beyond `init` (Button, Card, Table, Combobox, etc.) — added on-demand when a feature first needs them
 - Testcontainers, or any second integration-test strategy alongside the Postgres CI service
 - Authentication, server actions, and any `/api/v1` routes
-- Bout, event, scorecard, punch-stat, title, or ranking tables — everything not `weight_classes`/`fighters`/`fighter_aliases`/`source_documents`/`entity_evidence`
+- Bout, event, scorecard, punch-stat, title, or ranking tables (and their eventual `bout_evidence`/`event_evidence` companions) — everything not `weight_classes`/`fighters`/`fighter_aliases`/`source_documents`/`fighter_evidence`
 - Styling polish, responsive design, loading/empty/error states, images or avatars
 - Populating `src/db/fixtures/production/`
 
@@ -327,7 +339,7 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 - ✅ `pnpm install && pnpm setup && pnpm dev` on a fresh clone renders `/fighters` with seeded fictional data in under 5 minutes.
 - ✅ CI (`.github/workflows/ci.yml`) runs install → type-check → lint → build → migrate → test on every push, fully green.
 - ✅ Every migration in `src/db/migrations/` is generated (`drizzle-kit generate`), committed, human-auditable, and never hand-edited.
-- ✅ No table carries a single `source_id`/`verification_status` pair implying one source explains a whole row; provenance is reachable only via `entity_evidence`.
+- ✅ `fighters` (the one Tier 2 entity in scope) carries no `source_id`/`verification_status` pair implying one source explains a whole row; its provenance is reachable only via `fighter_evidence`, with a real FK to `fighters(id)` — not a generic polymorphic table.
 - ✅ Zero real fighter names, records, or biographical facts exist anywhere in the repository (fixtures or otherwise). Real weight-class definitions are the one deliberate exception (sport rules, not fighter facts).
 - ✅ Migrations never run automatically from app boot or a deploy hook — only via explicit `pnpm db:migrate`.
 - ✅ Exactly one integration-test strategy is in use (CI Postgres service + local Compose test database) — no Testcontainers.
@@ -355,10 +367,11 @@ This means **`fighters` and `weight_classes` carry no `source_id` or `verificati
 
 ## Risk checklist
 
-- ⚠️ **Provenance model divergence:** this doc's `entity_evidence` design supersedes DATABASE.md's row-level `source_id` approach and ADR-005. Update those docs before or during 1B implementation so later slices (3, 5, 6 — which all reference row-level provenance today) aren't built against a stale model.
+- ⚠️ **Keep DATABASE.md and this doc in sync going forward:** DATABASE.md and [ADR-013](DECISIONS.md) are now the canonical source for the provenance model (`source_documents` + per-domain evidence tables, `fighter_evidence` first). If either changes later, update the other in the same pass — this is exactly the kind of drift that caused the original entity-type/entity-id sketch here to briefly diverge from what DATABASE.md ended up specifying.
 - ⚠️ **`drizzle-kit generate` vs `migrate` vs `push` confusion:** a coding model defaulting to `push` from habit will silently bypass the auditable-migration requirement. Call this out explicitly in any prompt handed off for 1B.
 - ⚠️ **Fixture drift toward real data:** it's tempting for a coding model to "improve" fictional fixtures by making them resemble real fighters for realism. Explicitly forbid this in task prompts; review fixture files for real names before merging.
 - ⚠️ **Two-database Compose setup only matters locally:** CI only ever needs `punchstats_test` (no app boot, no dev database) — don't over-port the local two-database init script into CI.
-- ⚠️ **`entity_evidence` has no consumer yet:** it exists in Slice 1B purely as groundwork; nothing queries it until a later slice surfaces provenance badges in the UI. Leave the one-line comment pointing back to this doc so it doesn't read as dead/accidental complexity.
+- ⚠️ **`fighter_evidence` has no consumer yet:** it exists in Slice 1B purely as groundwork; nothing queries it until a later slice surfaces provenance badges in the UI. Leave the one-line comment pointing back to this doc so it doesn't read as dead/accidental complexity.
+- ⚠️ **Don't reintroduce the polymorphic pattern by accident:** when `bout_evidence`/`event_evidence` are added in later slices, copy `fighter_evidence`'s shape (a real FK per table) — not a shared `entity_type`/`entity_id` table, which DATABASE.md explicitly rejects (see ADR-013).
 - ⚠️ **Windows/Docker Desktop path quirks:** if `docker compose up -d` fails to mount `./docker/init`, check for Windows path translation issues (WSL2 backend is more forgiving than Hyper-V).
 - ⚠️ **CI workflow file is edited three times (1A, 1B, 1C):** write it in 1A anticipating appends (comments marking where later steps will go) so 1B/1C tasks don't need to restructure it.
